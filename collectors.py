@@ -605,63 +605,125 @@ def compile_news_feed(results: dict[str, pd.DataFrame]) -> pd.DataFrame:
 # Official NSE "Download as CSV" endpoints (&csv=true)
 # ---------------------------------------------------------------------------
 
+NSE_CSV_CATEGORIES: dict[str, str] = {
+    "corporate_actions": "Corporate Actions (CF-CA)",
+    "announcements": "Corporate Announcements (CF-AN)",
+    "financial_results": "Financial Results (CF-FR)",
+    "integrated_filings": "Integrated Filings Financials",
+    "event_calendar": "Event Calendar / Board Meetings",
+    "shareholding": "Shareholding Pattern",
+    "price_history": "Historical Equity Prices",
+}
+
+
+def _extract_cd_filename(resp: requests.Response, fallback: str) -> str:
+    cd = resp.headers.get("content-disposition") or ""
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\r\n]+)"?', cd, flags=re.IGNORECASE)
+    if m:
+        name = Path(m.group(1).strip()).name
+        if name:
+            return name
+    return fallback
+
+
 def download_nse_official_csvs(
     symbol: str,
     days: int = 365,
+    categories: list[str] | None = None,
 ) -> tuple[dict[str, bytes], dict[str, str]]:
-    """Download the official 'Download as CSV' files directly from nseindia.com."""
+    """Download the official 'Download (.csv)' files directly from nseindia.com, preserving NSE's exact filenames."""
     sym = symbol.strip().upper()
+    today_tag = datetime.now().strftime("%d-%b-%Y")
     end_dmy = datetime.now().strftime("%d-%m-%Y")
     start_dmy = (datetime.now() - timedelta(days=days)).strftime("%d-%m-%Y")
 
-    endpoints: dict[str, tuple[str, dict[str, Any]]] = {
-        "nse_official_announcements.csv": (
-            "https://www.nseindia.com/api/corporate-announcements",
-            {"index": "equities", "symbol": sym, "csv": "true"},
-        ),
-        "nse_official_corporate_actions.csv": (
+    endpoints: dict[str, tuple[str, dict[str, Any], str]] = {
+        "corporate_actions": (
             "https://www.nseindia.com/api/corporates-corporateActions",
             {"index": "equities", "symbol": sym, "csv": "true"},
+            f"CF-CA-equities-{sym}-{today_tag}.csv",
         ),
-        "nse_official_financial_results.csv": (
+        "announcements": (
+            "https://www.nseindia.com/api/corporate-announcements",
+            {"index": "equities", "symbol": sym, "csv": "true"},
+            f"CF-AN-equities-{sym}-{today_tag}.csv",
+        ),
+        "financial_results": (
             "https://www.nseindia.com/api/corporates-financial-results",
             {"index": "equities", "symbol": sym, "period": "Quarterly", "csv": "true"},
+            f"CF-FR-equities-{sym}-{today_tag}.csv",
         ),
-        "nse_official_integrated_filings.csv": (
+        "integrated_filings": (
             "https://www.nseindia.com/api/integrated-filing-results",
             {"index": "equities", "symbol": sym, "csv": "true"},
+            f"CF-Integrated-Filing-equities-{sym}-{today_tag}.csv",
         ),
-        "nse_official_event_calendar.csv": (
+        "event_calendar": (
             "https://www.nseindia.com/api/event-calendar",
             {"index": "equities", "symbol": sym, "csv": "true"},
+            f"CF-Event-equities-{sym}-{today_tag}.csv",
         ),
-        "nse_official_shareholding.csv": (
+        "shareholding": (
             "https://www.nseindia.com/api/corporate-share-holdings-master",
             {"index": "equities", "symbol": sym, "csv": "true"},
+            f"CF-Shareholding-Pattern-equities-{sym}-{today_tag}.csv",
         ),
-        "nse_official_price_history.csv": (
+        "price_history": (
             "https://www.nseindia.com/api/historicalOR/cm/equity",
             {"symbol": sym, "series": '["EQ"]', "from": start_dmy, "to": end_dmy, "csv": "true"},
+            f"Quote-Equity-{sym}-EQ-{start_dmy}-to-{end_dmy}.csv",
         ),
     }
 
+    selected = categories if categories is not None else list(endpoints.keys())
     csv_files: dict[str, bytes] = {}
     errors: dict[str, str] = {}
 
-    for filename, (url, params) in endpoints.items():
+    for key in selected:
+        if key not in endpoints:
+            continue
+        url, params, fallback_name = endpoints[key]
         try:
             resp = _nse_get(url, params=params, timeout=25)
-            content = resp.content
-            # Normalize BOM cleanly to UTF-8 with BOM or plain UTF-8 so Excel & pandas both open cleanly
-            text = content.decode("utf-8-sig", errors="replace").strip()
+            text = resp.content.decode("utf-8-sig", errors="replace").strip()
             if text and not text.lower().startswith("<html") and not text.lower().startswith("<!doctype"):
-                csv_files[filename] = text.encode("utf-8-sig")
+                fname = _extract_cd_filename(resp, fallback_name)
+                csv_files[fname] = text.encode("utf-8-sig")
             else:
-                errors[filename] = "Empty or non-CSV response from NSE"
+                errors[fallback_name] = "Empty or non-CSV response from NSE"
         except Exception as e:
-            errors[filename] = f"{type(e).__name__}: {e}"
+            errors[fallback_name] = f"{type(e).__name__}: {e}"
 
     return csv_files, errors
+
+
+def batch_extract_nse_csvs(
+    symbols: list[str],
+    categories: list[str] | None = None,
+    days: int = 365,
+) -> tuple[dict[str, dict[str, bytes]], dict[str, dict[str, str]], Path]:
+    """Extract official NSE CSVs for each symbol in a list and save to data/nse_csv_exports/<SYMBOL>/."""
+    export_root = DATA_DIR / "nse_csv_exports"
+    export_root.mkdir(parents=True, exist_ok=True)
+
+    all_files: dict[str, dict[str, bytes]] = {}
+    all_errors: dict[str, dict[str, str]] = {}
+
+    for raw_sym in symbols:
+        sym = raw_sym.strip().upper()
+        if not sym:
+            continue
+        csvs, errs = download_nse_official_csvs(sym, days=days, categories=categories)
+        if csvs:
+            sym_dir = export_root / sym
+            sym_dir.mkdir(parents=True, exist_ok=True)
+            for fname, data in csvs.items():
+                (sym_dir / fname).write_bytes(data)
+        all_files[sym] = csvs
+        if errs:
+            all_errors[sym] = errs
+
+    return all_files, all_errors, export_root
 
 
 # ---------------------------------------------------------------------------

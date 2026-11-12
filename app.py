@@ -25,6 +25,8 @@ import streamlit as st
 
 from collectors import (
     INDEX_CSV_URLS,
+    NSE_CSV_CATEGORIES,
+    batch_extract_nse_csvs,
     collect_bse_announcements,
     collect_corporate_actions,
     collect_earnings_summary,
@@ -953,6 +955,15 @@ with tab_announcements:
                 "attchmntFile": st.column_config.LinkColumn("Attachment", display_text="Open PDF ↗"),
             },
         )
+        for fname, raw_bytes in official_csvs.items():
+            if fname.startswith("CF-AN-") or "announcements" in fname:
+                st.download_button(
+                    f"⬇ Download Official NSE CSV ({fname})",
+                    data=raw_bytes,
+                    file_name=fname,
+                    mime="text/csv",
+                    key=f"tab4_dl_{fname}",
+                )
     else:
         st.info("No NSE corporate announcements available.")
 
@@ -993,6 +1004,15 @@ with tab_actions:
                     "faceVal": "Face Value",
                 },
             )
+            for fname, raw_bytes in official_csvs.items():
+                if fname.startswith("CF-CA-") or "corporate_actions" in fname:
+                    st.download_button(
+                        f"⬇ Download Official NSE CSV ({fname})",
+                        data=raw_bytes,
+                        file_name=fname,
+                        mime="text/csv",
+                        key=f"tab5_dl_{fname}",
+                    )
         else:
             st.info("No corporate actions returned.")
 
@@ -1075,17 +1095,25 @@ with tab_downloads:
     )
 
     if official_csvs:
-        friendly_labels = {
-            "nse_official_announcements.csv": "NSE Corporate Announcements CSV",
-            "nse_official_corporate_actions.csv": "NSE Corporate Actions CSV",
-            "nse_official_financial_results.csv": "NSE Quarterly Financial Results CSV",
-            "nse_official_integrated_filings.csv": "NSE Integrated Filing Financials CSV",
-            "nse_official_event_calendar.csv": "NSE Board Meetings & Event Calendar CSV",
-            "nse_official_shareholding.csv": "NSE Shareholding Pattern CSV",
-            "nse_official_price_history.csv": "NSE Historical Price Data CSV",
-        }
+        def _friendly_nse_label(fname: str) -> str:
+            if fname.startswith("CF-CA-") or "corporate_actions" in fname:
+                return "NSE Corporate Actions CSV"
+            if fname.startswith("CF-AN-") or "announcements" in fname:
+                return "NSE Corporate Announcements CSV"
+            if fname.startswith("CF-FR-") or "financial_results" in fname:
+                return "NSE Quarterly Financial Results CSV"
+            if fname.startswith("CF-Integrated-Filing-") or "integrated_filings" in fname:
+                return "NSE Integrated Filing Financials CSV"
+            if fname.startswith("CF-Event-") or "event_calendar" in fname:
+                return "NSE Board Meetings & Event Calendar CSV"
+            if fname.startswith("CF-Shareholding-") or "shareholding" in fname:
+                return "NSE Shareholding Pattern CSV"
+            if fname.startswith("Quote-Equity-") or "price_history" in fname:
+                return "NSE Historical Price Data CSV"
+            return fname
+
         for fname, raw_bytes in official_csvs.items():
-            title_lbl = friendly_labels.get(fname, fname)
+            title_lbl = _friendly_nse_label(fname)
             size_kb = len(raw_bytes) / 1024.0
             try:
                 preview_df = pd.read_csv(io.BytesIO(raw_bytes))
@@ -1100,7 +1128,7 @@ with tab_downloads:
             c3.download_button(
                 "⬇ Download CSV",
                 data=raw_bytes,
-                file_name=f"{sym}_{fname}",
+                file_name=fname if fname.startswith(("CF-", "Quote-")) else f"{sym}_{fname}",
                 mime="text/csv",
                 key=f"official_dl_{fname}",
                 width="stretch",
@@ -1110,6 +1138,67 @@ with tab_downloads:
                     st.dataframe(preview_df.head(20), width="stretch", hide_index=True)
     else:
         st.info("Official NSE CSVs were not downloaded for this run. Enable 'Download official NSE CSVs' in the sidebar and click Refresh.")
+
+    st.divider()
+    st.subheader("🗂️ Batch Extract Official NSE CSVs for Multiple Stocks")
+    st.caption(
+        "Extract the exact NSE website CSVs (such as `CF-CA-equities-<SYMBOL>-<DATE>.csv`, "
+        "`CF-AN-equities-<SYMBOL>-<DATE>.csv`, etc.) for multiple stocks at once into "
+        "`data/nse_csv_exports/<SYMBOL>/` and download as a single ZIP."
+    )
+
+    wl_file = Path(__file__).parent / "watchlist.txt"
+    default_wl = (
+        [l.strip().upper() for l in wl_file.read_text().splitlines() if l.strip() and not l.strip().startswith("#")]
+        if wl_file.exists()
+        else ["RELIANCE", "TCS", "HDFCBANK", "INFY"]
+    )
+    batch_options = sorted(set(symbol_list) | set(default_wl) | {sym})
+    default_sel = [s for s in default_wl if s in batch_options][:10]
+
+    b1, b2 = st.columns([2, 1.5])
+    batch_stocks = b1.multiselect(
+        "Select stocks to extract CSVs for",
+        options=batch_options,
+        default=default_sel,
+        key="batch_stocks_select",
+    )
+    batch_cats = b2.multiselect(
+        "Which NSE CSVs to download",
+        options=list(NSE_CSV_CATEGORIES.keys()),
+        default=["corporate_actions", "announcements", "financial_results"],
+        format_func=lambda k: NSE_CSV_CATEGORIES[k],
+        key="batch_cats_select",
+    )
+
+    if st.button("⬇ Extract Official NSE CSVs for Selected Stocks", key="btn_batch_extract", disabled=not (batch_stocks and batch_cats)):
+        with st.spinner(f"Extracting official NSE CSVs for {len(batch_stocks)} stocks…"):
+            extracted, batch_errs, export_root = batch_extract_nse_csvs(
+                batch_stocks, categories=batch_cats, days=history_days
+            )
+        zbuf = io.BytesIO()
+        total_files = 0
+        with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for b_sym, files_dict in extracted.items():
+                for fname, raw_b in files_dict.items():
+                    zf.writestr(f"{b_sym}/{fname}", raw_b)
+                    total_files += 1
+        zbuf.seek(0)
+        st.session_state["batch_zip_bytes"] = zbuf.read()
+        st.session_state["batch_summary"] = f"Extracted {total_files} official NSE CSVs across {len(extracted)} stocks → `{export_root}`"
+        if batch_errs:
+            st.warning(f"Some files had notices: {batch_errs}")
+
+    if "batch_zip_bytes" in st.session_state and st.session_state["batch_zip_bytes"]:
+        st.success(st.session_state.get("batch_summary", "Batch extraction complete!"))
+        st.download_button(
+            "📦 Download Batch Official NSE CSVs (.zip)",
+            data=st.session_state["batch_zip_bytes"],
+            file_name="nse_official_csvs_batch.zip",
+            mime="application/zip",
+            type="primary",
+            key="dl_batch_zip",
+        )
 
     st.divider()
     st.subheader("📊 Compiled & Enriched Datasets")
