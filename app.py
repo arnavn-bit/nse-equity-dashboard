@@ -13,6 +13,7 @@ Run:
 
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import zipfile
@@ -22,6 +23,10 @@ from typing import Any
 import altair as alt
 import pandas as pd
 import streamlit as st
+
+import collectors as _collectors_mod
+if not hasattr(_collectors_mod, "NSE_CSV_CATEGORIES"):
+    importlib.reload(_collectors_mod)
 
 from collectors import (
     INDEX_CSV_URLS,
