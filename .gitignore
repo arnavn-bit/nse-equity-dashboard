@@ -1,0 +1,14 @@
+# Virtual environments & caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS & editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Collected runtime datasets (large generated CSV/JSON runs)
+data/
